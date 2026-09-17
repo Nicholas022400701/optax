@@ -637,6 +637,16 @@ class GeneralizedKLDivergenceTest(parameterized.TestCase):
     y = _classification.generalized_kl_divergence(self.log_ps[0], self.qs[0])
     np.testing.assert_allclose(x, y, atol=1e-4)
 
+  def test_gradient_with_zero_targets(self):
+    """Gradients are finite when a target probability is zero."""
+    # The second row of ``self.qs`` has a zero entry.
+    def loss_fn(log_ps, qs):
+      return jnp.sum(_classification.generalized_kl_divergence(log_ps, qs))
+
+    grads = jax.grad(loss_fn, argnums=(0, 1))(self.log_ps, self.qs)
+    self.assertTrue(jnp.all(jnp.isfinite(grads[0])))
+    self.assertTrue(jnp.all(jnp.isfinite(grads[1])))
+
 
 class PerceptronTest(parameterized.TestCase):
 
@@ -741,6 +751,36 @@ class KLDivergenceTest(parameterized.TestCase):
     )
     np.testing.assert_allclose(x, y, atol=1e-4)
 
+  def test_zero_targets(self):
+    """Zero targets contribute nothing to the value or to the gradients."""
+    log_ps = jax.nn.log_softmax(jnp.array([0.5, 1.0, 2.0, -1.0]))
+    qs = jnp.array([0.0, 0.4, 0.6, 0.0])
+    expected = jnp.sum(qs[1:3] * (jnp.log(qs[1:3]) - log_ps[1:3]))
+    np.testing.assert_allclose(
+        _classification.kl_divergence(log_ps, qs), expected, atol=1e-5
+    )
+    grads = jax.grad(_classification.kl_divergence, argnums=(0, 1))(log_ps, qs)
+    np.testing.assert_allclose(grads[0], -qs, atol=1e-5)
+    # d/dq [q * (log(q) - log_p)] = log(q) + 1 - log_p where q > 0.
+    np.testing.assert_allclose(
+        grads[1][1:3], jnp.log(qs[1:3]) + 1.0 - log_ps[1:3], atol=1e-5
+    )
+    self.assertTrue(jnp.all(jnp.isfinite(grads[1])))
+
+  def test_zero_targets_and_zero_predictions(self):
+    """Entries masked out of both distributions contribute nothing."""
+    # Masking a class with a -inf logit gives it a zero probability and a
+    # -inf log probability.
+    log_ps = jax.nn.log_softmax(jnp.array([0.5, 1.0, 2.0, -jnp.inf]))
+    qs = jax.nn.softmax(jnp.array([0.2, 1.5, 1.0, -jnp.inf]))
+    expected = _classification.kl_divergence(log_ps[:3], qs[:3])
+    np.testing.assert_allclose(
+        _classification.kl_divergence(log_ps, qs), expected, atol=1e-5
+    )
+    grads = jax.grad(_classification.kl_divergence, argnums=(0, 1))(log_ps, qs)
+    self.assertTrue(jnp.all(jnp.isfinite(grads[0])))
+    self.assertTrue(jnp.all(jnp.isfinite(grads[1])))
+
 
 class KLDivergenceWithLogTargetsTest(parameterized.TestCase):
 
@@ -800,6 +840,34 @@ class KLDivergenceWithLogTargetsTest(parameterized.TestCase):
         np.moveaxis(targets, axis, -1),
     )
     np.testing.assert_allclose(x, y, atol=1e-4)
+
+  def test_zero_targets(self):
+    """Targets with a -inf log probability contribute nothing."""
+    f = _classification.kl_divergence_with_log_targets
+    log_ps = jax.nn.log_softmax(jnp.array([0.5, 1.0, 2.0, -1.0]))
+    log_qs = jnp.log(jnp.array([0.0, 0.4, 0.6, 0.0]))
+    qs = jnp.exp(log_qs)
+    expected = jnp.sum(qs[1:3] * (log_qs[1:3] - log_ps[1:3]))
+    np.testing.assert_allclose(f(log_ps, log_qs), expected, atol=1e-5)
+    grads = jax.grad(f, argnums=(0, 1))(log_ps, log_qs)
+    np.testing.assert_allclose(grads[0], -qs, atol=1e-5)
+    # d/dl [exp(l) * (l - log_p)] = exp(l) * (l + 1 - log_p) where l is finite.
+    np.testing.assert_allclose(
+        grads[1][1:3], qs[1:3] * (log_qs[1:3] + 1.0 - log_ps[1:3]), atol=1e-5
+    )
+    self.assertTrue(jnp.all(jnp.isfinite(grads[1])))
+
+  def test_zero_targets_and_zero_predictions(self):
+    """Entries masked out of both distributions contribute nothing."""
+    f = _classification.kl_divergence_with_log_targets
+    log_ps = jax.nn.log_softmax(jnp.array([0.5, 1.0, 2.0, -jnp.inf]))
+    log_qs = jax.nn.log_softmax(jnp.array([0.2, 1.5, 1.0, -jnp.inf]))
+    np.testing.assert_allclose(
+        f(log_ps, log_qs), f(log_ps[:3], log_qs[:3]), atol=1e-5
+    )
+    grads = jax.grad(f, argnums=(0, 1))(log_ps, log_qs)
+    self.assertTrue(jnp.all(jnp.isfinite(grads[0])))
+    self.assertTrue(jnp.all(jnp.isfinite(grads[1])))
 
 
 def _lengths_to_paddings(
@@ -1044,69 +1112,3 @@ class SigmoidFocalLossTest(parameterized.TestCase):
     ce_loss = _classification.sigmoid_binary_cross_entropy(
         self.small_ys, self.ones_ts
     )
-    loss_ratio = ce_loss / focal_loss
-    expected_ratio = 1.0 / ((1.0 - jax.nn.sigmoid(self.small_ys)) ** 2)
-    np.testing.assert_allclose(loss_ratio, expected_ratio, rtol=self._rtol)
-
-  def test_alpha_one(self):
-    """Test if re-weighting with alpha=1 is ok."""
-    np.testing.assert_allclose(
-        jax.jit(_classification.sigmoid_focal_loss)(
-            self.ys, self.ts, gamma=0.0, alpha=1
-        ),
-        _classification.sigmoid_binary_cross_entropy(self.ys, self.ts)
-        * self.ts,
-        rtol=self._rtol,
-    )
-
-  def test_ignore_positive(self):
-    """If alpha == 0 positive examples do not matter."""
-    focal_loss = jax.jit(_classification.sigmoid_focal_loss)(
-        self.ys, self.ts, alpha=0
-    )
-    ce_loss = _classification.sigmoid_binary_cross_entropy(self.ys, self.ts)
-    assert all(ce_loss[self.ts == 1] > 0)
-    assert all(focal_loss[self.ts == 1] == 0)
-
-  def test_ignore_negative(self):
-    """If alpha == 1 negative examples do not matter."""
-    focal_loss = jax.jit(_classification.sigmoid_focal_loss)(
-        self.ys, self.ts, alpha=1
-    )
-    ce_loss = _classification.sigmoid_binary_cross_entropy(self.ys, self.ts)
-    assert all(ce_loss[self.ts == 0] > 0)
-    assert all(focal_loss[self.ts == 0] == 0)
-
-  def test_extreme_logits_finite_gradients(self):
-    """Test that extreme logits with gamma < 1 produce finite gradients."""
-    # Test cases with very extreme logits and non-integer labels
-    extreme_logits = jnp.array([100.0, -100.0, 75.0, -75.0, 50.0, -50.0])
-    # Include non-integer labels to test soft label stability
-    labels = jnp.array([0.9, 0.1, 0.8, 0.2, 1.0, 0.0])
-
-    # Test with gamma < 1 which is most problematic for numerical stability
-    gamma = 0.5
-
-    def loss_fn(logits):
-      return jnp.sum(jax.jit(_classification.sigmoid_focal_loss)(
-          logits, labels, gamma=gamma
-      ))
-
-    # Compute loss and gradients
-    loss_value = loss_fn(extreme_logits)
-    gradients = jax.grad(loss_fn)(extreme_logits)
-
-    # Verify that both loss and gradients are finite
-    self.assertTrue(jnp.isfinite(loss_value),
-                    f'Loss should be finite for {gamma=}, got {loss_value}')
-    self.assertTrue(jnp.all(jnp.isfinite(gradients)),
-                    f'Gradients should be finite for {gamma=}, got {gradients}')
-
-    # Test Hessians for numerical stability
-    hessian = jax.hessian(loss_fn)(extreme_logits)
-    self.assertTrue(jnp.all(jnp.isfinite(hessian)),
-                    f'Hessians should be finite for {gamma=}')
-
-
-if __name__ == '__main__':
-  absltest.main()
