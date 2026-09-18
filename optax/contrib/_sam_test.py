@@ -101,6 +101,38 @@ class SAMTest(parameterized.TestCase):
     test_utils.assert_trees_all_close(
         params, final_params, rtol=3e-2, atol=3e-2)
 
+  @parameterized.product(opaque_mode=(False, True))
+  def test_sync_period_one_matches_base_optimizer(self, opaque_mode):
+    # With sync_period=1 there is no adversarial step, so every update must be
+    # exactly the update of the base optimizer from the current parameters.
+    base_opt = alias.sgd(learning_rate=1e-1)
+    adv_opt = combine.chain(_sam.normalize(), alias.sgd(learning_rate=1e-1))
+    opt = _sam.sam(base_opt, adv_opt, sync_period=1, opaque_mode=opaque_mode)
+    initial_params, _, get_updates = _setup_parabola(jnp.dtype('float32'))
+
+    if opaque_mode:
+      update_kwargs = {'grad_fn': lambda p, _: get_updates(p)}
+    else:
+      update_kwargs = {}
+
+    sam_params = initial_params
+    sam_state = opt.init(sam_params)
+    base_params = initial_params
+    base_state = base_opt.init(base_params)
+    for _ in range(5):
+      sam_updates, sam_state = opt.update(
+          get_updates(sam_params), sam_state, sam_params, **update_kwargs
+      )
+      sam_params = update.apply_updates(sam_params, sam_updates)
+
+      base_updates, base_state = base_opt.update(
+          get_updates(base_params), base_state, base_params
+      )
+      base_params = update.apply_updates(base_params, base_updates)
+
+      test_utils.assert_trees_all_close(
+          sam_params, base_params, rtol=1e-6, atol=1e-6)
+
 
 if __name__ == '__main__':
   absltest.main()
