@@ -133,6 +133,51 @@ class SAMTest(parameterized.TestCase):
       test_utils.assert_trees_all_close(
           sam_params, base_params, rtol=1e-6, atol=1e-6)
 
+  @parameterized.product(sync_period=(1, 2, 3), reset_state=(True, False))
+  def test_transparent_mode_matches_opaque_mode(self, sync_period, reset_state):
+    # The outer optimizer depends on the parameters through the weight decay
+    # and is stateful, so this checks that the transparent mode feeds it the
+    # parameters of the last sync and only keeps its state on the last step.
+    base_opt = alias.adamw(learning_rate=1e-1, weight_decay=1e-2)
+    adv_opt = combine.chain(_sam.normalize(), alias.adam(learning_rate=1e-1))
+    initial_params, _, get_updates = _setup_parabola(jnp.dtype('float32'))
+    grad_fn = lambda p, _: get_updates(p)
+
+    transparent_opt = _sam.sam(
+        base_opt, adv_opt, sync_period=sync_period, reset_state=reset_state
+    )
+    opaque_opt = _sam.sam(
+        base_opt,
+        adv_opt,
+        sync_period=sync_period,
+        reset_state=reset_state,
+        opaque_mode=True,
+    )
+    transparent_params = initial_params
+    transparent_state = transparent_opt.init(transparent_params)
+    opaque_params = initial_params
+    opaque_state = opaque_opt.init(opaque_params)
+    for _ in range(5):
+      for _ in range(sync_period):
+        updates, transparent_state = transparent_opt.update(
+            get_updates(transparent_params),
+            transparent_state,
+            transparent_params,
+        )
+        transparent_params = update.apply_updates(transparent_params, updates)
+
+      updates, opaque_state = opaque_opt.update(
+          get_updates(opaque_params),
+          opaque_state,
+          opaque_params,
+          grad_fn=grad_fn,
+      )
+      opaque_params = update.apply_updates(opaque_params, updates)
+
+      test_utils.assert_trees_all_close(
+          transparent_params, opaque_params, rtol=1e-6, atol=1e-6
+      )
+
 
 if __name__ == '__main__':
   absltest.main()
